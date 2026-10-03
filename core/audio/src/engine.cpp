@@ -90,7 +90,7 @@ void AudioEngine::prepare(RenderConfig config, RenderGraph graph, RealtimeState 
     monitor_enabled_ = graph_.monitoring; input_peak_ = 0;
     Control discarded;
     while (controls_.pop(discarded)) {}
-    rt_ = initial;
+    rt_ = initial; pending_seek_.reset();
     callbacks_ = 0; input_overflows_ = 0; input_underflows_ = 0;
     output_underflows_ = 0; output_overflows_ = 0; deadlines_ = 0;
     invalid_blocks_ = 0; clipped_ = 0; missing_inputs_ = 0; disk_underruns_ = 0;
@@ -155,10 +155,15 @@ void AudioEngine::process(const float* input, float* output, std::uint32_t frame
             if (rt_.playback == PlaybackState::playing) rt_.playback = PlaybackState::paused;
             break;
         case ControlKind::stop:
-            rt_.playback = PlaybackState::stopped; rt_.sample = 0;
+            pending_seek_.reset(); rt_.playback = PlaybackState::stopped; rt_.sample = 0;
             if (graph_.processors) graph_.processors->panic();
             break;
+        case ControlKind::prepared_seek:
+            if (graph_.recording) { graph_.recording->discontinuity(); break; }
+            if (control.a >= 0 && control.a <= max_sample) pending_seek_ = control.a;
+            break;
         case ControlKind::seek:
+            pending_seek_.reset();
             if (graph_.recording) { graph_.recording->discontinuity(); break; }
             if (control.a >= 0 && control.a <= max_sample) {
                 rt_.sample = control.a;
@@ -173,6 +178,25 @@ void AudioEngine::process(const float* input, float* output, std::uint32_t frame
             break;
         }
     }
+    // A later control prime can replace an earlier queued seek's warm target.
+    // Pin/verify the candidate before changing RT position. If unavailable, keep
+    // rendering the current head and retry next block; callback never waits.
+    bool seek_pinned = false;
+    if (pending_seek_) {
+        bool ready = true;
+        for (auto& voice : graph_.voices) if (voice.stream) {
+            const auto source = voice.source_offset+std::clamp(*pending_seek_-voice.start,Sample{0},voice.length-1);
+            if (!voice.stream->try_begin(source,frames)) ready = false;
+        }
+        if (ready) {
+            rt_.sample = *pending_seek_; pending_seek_.reset(); seek_pinned = true;
+            for (auto& voice : graph_.voices) if (voice.stream)
+                voice.stream->accept_seek(voice.source_offset+std::clamp(rt_.sample-voice.start,Sample{0},voice.length-1));
+            if (graph_.processors) graph_.processors->panic();
+        } else {
+            for (auto& voice : graph_.voices) if (voice.stream) (void)voice.stream->end();
+        }
+    }
     std::fill_n(output, static_cast<std::size_t>(frames) * config_.output_channels, 0.0F);
     float peak{};
     if (input) for (std::size_t n=0; n<static_cast<std::size_t>(frames)*config_.input_channels; ++n)
@@ -183,8 +207,10 @@ void AudioEngine::process(const float* input, float* output, std::uint32_t frame
         graph_.recording->capture(input,config_.input_channels,frames,rt_.sample);
     }
     if (!input && monitor_enabled_ && !graph_.monitor.empty()) missing_inputs_.fetch_add(1, std::memory_order_relaxed);
-    for (auto& voice : graph_.voices) if (voice.stream)
+    if (!seek_pinned) for (auto& voice : graph_.voices) if (voice.stream) {
+        if (!pending_seek_) voice.stream->cancel_seek();
         voice.stream->begin(voice.source_offset+std::clamp(rt_.sample-voice.start,Sample{0},voice.length-1));
+    }
     for (std::uint32_t frame = 0; frame < frames; ++frame) {
         const auto out = static_cast<std::size_t>(frame) * config_.output_channels;
         // Monitoring is independent of transport and playback source density.
@@ -299,7 +325,7 @@ void EngineTransport::seek(Sample sample) {
     if (sample < 0 || sample > max_sample) throw std::invalid_argument("invalid seek");
     (void)timeline_.to_ticks(sample);
     engine_->prime_streams(sample);
-    send({ControlKind::seek, sample});
+    send({ControlKind::prepared_seek, sample});
 }
 void EngineTransport::set_loop(std::optional<LoopRange> loop) {
     if (loop && (loop->start < 0 || loop->end > max_sample || loop->start >= loop->end))

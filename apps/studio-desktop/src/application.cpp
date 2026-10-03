@@ -13,6 +13,9 @@ void require(bool ok, const char* message) { if (!ok) throw std::invalid_argumen
 std::string utf8(const std::filesystem::path& path) {
     auto value = path.u8string(); return {reinterpret_cast<const char*>(value.data()),value.size()};
 }
+std::string media_ref(const std::filesystem::path& path) {
+    const auto value = path.generic_u8string(); return {reinterpret_cast<const char*>(value.data()),value.size()};
+}
 }
 std::string_view workspace_name(Workspace w) {
     switch (w) { case Workspace::arrange: return "Arrange"; case Workspace::edit: return "Edit";
@@ -92,7 +95,7 @@ void Application::replace(persistence::ProjectDocument next) {
     auto transport = std::make_shared<audio::EngineTransport>(engine_,Timeline(next.project.time,next.project.sample_rate));
     auto musical = std::make_unique<MusicalTimeline>(Services{projects,transport});
     for (auto& [key,value] : assets_) { (void)key; *value.cancel = true; }
-    assets_.clear(); waveform_error_.clear();
+    assets_.clear(); owned_media_.clear(); waveform_error_.clear();
     document_ = std::move(next);
     services_ = {projects,transport}; graphs_ = std::move(graphs);
     transport_ = std::move(transport); musical_ = std::move(musical);
@@ -112,7 +115,7 @@ void Application::demo() {
 void Application::open_project(const std::filesystem::path& path) {
     require_not_recording();
     auto next = persistence::load_project(path); replace(std::move(next));
-    path_ = path; asset_root_ = path.parent_path(); unsaved_ = false;
+    path_ = std::filesystem::absolute(path).lexically_normal(); asset_root_ = path_.parent_path(); unsaved_ = false;
 }
 void Application::import_wav(const std::filesystem::path& path) {
     require_not_recording();
@@ -137,19 +140,72 @@ persistence::ProjectDocument Application::snapshot() const {
     });
     for (const auto& t : result.project.tracks) if (std::none_of(result.mixer.begin(),result.mixer.end(),[&](const auto& m) { return m.track == t.id; }))
         result.mixer.push_back({t.id,1,0,false,false});
+    for (auto& clip : result.project.clips) {
+        if (const auto found = owned_media_.find(clip.source); found != owned_media_.end())
+            clip.source = media_ref(found->second.lexically_relative(asset_root_));
+        else if (!asset_root_.empty()) {
+            const auto source = std::filesystem::path(std::u8string(clip.source.begin(),clip.source.end()));
+            const auto relative = source.lexically_normal().lexically_relative(asset_root_/"Media");
+            if (source.is_absolute() && !relative.empty() && !relative.is_absolute() && *relative.begin() != "..")
+                clip.source = media_ref(std::filesystem::path("Media")/relative);
+        }
+    }
     result.validate(); return result;
 }
-void Application::save_project(const std::filesystem::path& path) {
+void Application::save_project(const std::filesystem::path& requested) {
     require_not_recording();
-    // No runtime parameter editor yet: GraphStore is authoritative, processor state unchanged.
+    const auto path = std::filesystem::absolute(requested).lexically_normal();
+    require(!path.filename().empty(),"choose a project filename");
     auto document = snapshot();
-    if (std::filesystem::absolute(path.parent_path().empty() ? "." : path.parent_path()) !=
-        std::filesystem::absolute(asset_root_.empty() ? "." : asset_root_)) {
-        for (const auto& clip : document.project.clips) if (clip.source != "mrs:demo-tone" &&
-            std::filesystem::path(std::u8string(clip.source.begin(),clip.source.end())).is_relative())
-            throw std::invalid_argument("Save As with relative media requires the original project folder in this foundation build");
+    // Validate identity BEFORE adding content to an existing project directory.
+    if (std::filesystem::exists(path)) {
+        const auto previous = persistence::load_project(path);
+        require(previous.project.id == document.project.id && previous.generation <= document.generation,"project identity/generation mismatch");
     }
-    persistence::save_project(path,document); path_ = path;
+    const auto root = path.parent_path();
+    const bool relocating = !asset_root_.empty() && root != asset_root_;
+    std::set<std::string> keys, current;
+    for (const auto& clip : services_.projects->state().project->clips) if (clip.source != "mrs:demo-tone") { keys.insert(clip.source); current.insert(clip.source); }
+    for (const auto& [key,value] : assets_) { (void)value; if (key != "mrs:demo-tone") keys.insert(key); }
+    const auto resolve = [&](const std::string& key) {
+        if (const auto found = owned_media_.find(key); found != owned_media_.end()) return found->second;
+        auto source = std::filesystem::path(std::u8string(key.begin(),key.end()));
+        return source.is_absolute() ? source : asset_root_/source;
+    };
+    bool needs_copy = relocating;
+    for (const auto& key : keys) {
+        const auto relative = resolve(key).lexically_normal().lexically_relative(root/"Media");
+        if (relative.empty() || relative.is_absolute() || *relative.begin() == "..") needs_copy = true;
+    }
+    if (needs_copy) require_not_playing(); // media/Save As rebuilds need quiescent callbacks
+    MediaCopy copies(root);
+    if (relocating) { copies.content(asset_root_,"Media"); copies.content(asset_root_,"Mixdown"); }
+    std::map<std::string,std::filesystem::path> owned;
+    for (const auto& key : keys) {
+        const auto source = resolve(key);
+        if (!std::filesystem::exists(source) && !current.contains(key)) continue; // already-missing Undo media stays a missing reference
+        owned[key] = copies.media(source);
+    }
+    for (std::size_t i=0; i<document.project.clips.size(); ++i) {
+        const auto& original = services_.projects->state().project->clips[i].source;
+        if (original != "mrs:demo-tone") document.project.clips[i].source = media_ref(owned.at(original).lexically_relative(root));
+    }
+    document.validate();
+    if (copies.copied()) require_not_playing();
+    persistence::save_project(path,document); copies.commit();
+    path_ = path; asset_root_ = root; owned_media_ = std::move(owned);
+    // Runtime keys/Undo are stable; move only their physical disk backing.
+    if (copies.copied()) {
+        for (auto& [key,cached] : assets_) if (cached.data->file) {
+            const auto found = owned_media_.find(key); if (found == owned_media_.end()) continue;
+            auto data = *cached.data; auto file = std::make_shared<audio::WavFile>(*data.file); file->path = found->second; data.file = std::move(file);
+            *cached.cancel = true; cached.pending = {}; // cancelled worker stops before the old source can be retired
+            cached.cancel = std::make_shared<std::atomic<bool>>(false);
+            cached.data = std::make_shared<const audio::AudioData>(std::move(data));
+            if (!cached.peaks) cached.pending = std::async(std::launch::async,[data=cached.data,cancel=cached.cancel] { return audio::Waveform(*data,cancel); });
+        }
+        rebuild_audio(); // same device handle, paused/stopped position and loop
+    }
     saved_project_revision_ = services_.projects->state().revision;
     saved_graph_revision_ = graphs_->state().revision; unsaved_ = false;
 }
@@ -172,9 +228,9 @@ void Application::require_not_playing() const {
     require_not_recording();
     require(engine_->state().playback != PlaybackState::playing,"Pause or stop playback before changing tracks or importing audio");
 }
-void Application::new_project(std::uint32_t rate) {
+void Application::new_project(std::uint32_t rate, std::string title) {
     require_not_recording();
-    auto d = foundation_demo(); d.project.id = new_id(); d.project.title = "Untitled";
+    auto d = foundation_demo(); d.project.id = new_id(); d.project.title = std::move(title);
     d.project.sample_rate = rate; d.project.tracks.clear(); d.project.clips.clear();
     d.project.chords.clear(); d.project.sections.clear(); d.project.markers.clear(); d.mixer.clear(); d.live_notes.clear();
     d.validate(); replace(std::move(d)); path_.clear(); asset_root_.clear();
@@ -196,7 +252,8 @@ std::shared_ptr<const audio::AudioData> Application::asset(const std::string& so
     else {
         require(!source.empty(),"clip has no audio source");
         auto path = std::filesystem::path(std::u8string(source.begin(),source.end()));
-        if (path.is_relative()) path = asset_root_ / path;
+        if (const auto owned = owned_media_.find(source); owned != owned_media_.end()) path = owned->second;
+        else if (path.is_relative()) path = asset_root_ / path;
         data = audio::open_wav(path);
     }
     auto ptr = std::make_shared<const audio::AudioData>(std::move(data)); cache_asset(source,ptr); return ptr;
@@ -264,14 +321,17 @@ void Application::import_wavs(const std::vector<std::filesystem::path>& paths) {
     require_not_playing(); require(!paths.empty() && paths.size() <= audio::max_voices,"select 1..128 WAV files");
     const auto current = services_.projects->state().project;
     require(current->clips.size()+paths.size() <= audio::max_voices,"too many playback clips");
+    // Inspect the entire source batch before copying content.
+    for (const auto& path : paths) require(audio::inspect_wav(path).sample_rate == current->sample_rate,"WAV/project sample-rate mismatch; import WAVs at the project rate");
+    std::unique_ptr<MediaCopy> copies;
+    if (!path_.empty()) copies = std::make_unique<MediaCopy>(asset_root_);
     std::vector<Track> tracks; std::vector<Clip> clips;
     std::map<std::string,std::shared_ptr<const audio::AudioData>> decoded;
     std::size_t bytes{};
     for (const auto& [key,cached] : assets_) { (void)key; bytes += cached.data->samples.size()*sizeof(float); }
-    // Inspect/decode the whole batch before committing one shared command.
-    // Long sources validate their headers here; samples validate as worker blocks decode.
-    for (const auto& path : paths) {
-        const auto source = utf8(std::filesystem::absolute(path).lexically_normal());
+    for (const auto& original : paths) {
+        const auto path = copies ? copies->media(original) : std::filesystem::absolute(original).lexically_normal();
+        const auto source = (copies ? media_ref(path.lexically_relative(asset_root_)) : utf8(path));
         std::shared_ptr<const audio::AudioData> data;
         if (assets_.contains(source)) data = assets_.at(source).data;
         else if (decoded.contains(source)) data = decoded.at(source);
@@ -281,13 +341,21 @@ void Application::import_wavs(const std::vector<std::filesystem::path>& paths) {
             data = std::make_shared<const audio::AudioData>(audio::open_wav(path,std::min<std::size_t>(8*1024*1024,512*1024*1024-bytes)));
             bytes += data->samples.size()*sizeof(float); decoded.emplace(source,data);
         }
-        require(data->sample_rate == current->sample_rate,"WAV/project sample-rate mismatch; import WAVs at the project rate");
         const auto id = new_id();
-        tracks.push_back({id,utf8(path.stem()),TrackKind::audio,{}});
-        clips.push_back({new_id(),id,utf8(path.filename()),0,data->frames(),0,source});
+        tracks.push_back({id,utf8(original.stem()),TrackKind::audio,{}});
+        clips.push_back({new_id(),id,utf8(original.filename()),0,data->frames(),0,source});
     }
-    for (auto& [source,data] : decoded) cache_asset(source,std::move(data));
-    edit(ImportAudio{std::move(tracks),std::move(clips)});
+    const auto revision = services_.projects->state().revision;
+    std::vector<std::string> cached;
+    try {
+        for (auto& [source,data] : decoded) { cache_asset(source,std::move(data)); cached.push_back(source); }
+        edit(ImportAudio{std::move(tracks),std::move(clips)});
+        if (copies) copies->commit();
+    } catch (...) {
+        if (services_.projects->state().revision != revision) { if (copies) copies->commit(); } // committed clips must retain their media
+        else for (const auto& source : cached) { *assets_.at(source).cancel = true; assets_.erase(source); }
+        throw;
+    }
 }
 audio::RenderGraph Application::render(const audio::DeviceConfig& c) {
     require(c.sample_rate == services_.projects->state().project->sample_rate,"device/project rate mismatch; choose the project rate (resampling is a later stage)");

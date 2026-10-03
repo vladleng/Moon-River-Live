@@ -3,6 +3,8 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <commdlg.h>
+#include <shlobj.h>
+#include <shellapi.h>
 #include <mrs/desktop.hpp>
 #include <mrs/version.hpp>
 #include <mrs/offline_device.hpp>
@@ -49,12 +51,21 @@ std::filesystem::path data_folder() {
     if (n == 0 || n >= buffer.size()) throw std::runtime_error("LOCALAPPDATA is unavailable");
     auto path = std::filesystem::path(buffer.data()) / L"MoonRiverStudio"; std::filesystem::create_directories(path); return path;
 }
-std::filesystem::path pick(HWND owner, bool save, bool wav = false) {
+std::filesystem::path studio_folder() {
+    PWSTR documents{};
+    const auto result = SHGetKnownFolderPath(FOLDERID_Documents,KF_FLAG_CREATE,nullptr,&documents);
+    if (FAILED(result)) throw std::runtime_error("Windows Documents folder is unavailable");
+    auto path = std::filesystem::path(documents)/L"MR Studio"; CoTaskMemFree(documents); return path;
+}
+std::filesystem::path pick(HWND owner, bool save, bool wav = false, const std::filesystem::path& initial = {}, std::wstring_view suggested = {}) {
     std::array<wchar_t,32768> path{};
+    if (suggested.size() >= path.size()) throw std::invalid_argument("project filename too long");
+    std::copy(suggested.begin(),suggested.end(),path.begin());
     OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = owner;
     ofn.lpstrFile = path.data(); ofn.nMaxFile = static_cast<DWORD>(path.size());
     ofn.lpstrFilter = wav ? L"WAV audio\0*.wav\0\0" : L"Moon River project\0*.mrsproject\0All files\0*.*\0\0";
     ofn.lpstrDefExt = wav ? L"wav" : L"mrsproject";
+    ofn.lpstrInitialDir = initial.empty() ? nullptr : initial.c_str();
     ofn.Flags = OFN_EXPLORER | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST | (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
     if (!(save ? GetSaveFileNameW(&ofn) : GetOpenFileNameW(&ofn))) {
         if (CommDlgExtendedError() != 0) throw std::runtime_error("File dialog failed"); return {};
@@ -81,7 +92,7 @@ enum ControlId {
     previous, next, loop, undo, redo, open, save, save_as, demo, import,
     audio_settings, tracks = 140, rename_edit, rename,
     new_project_button = 160, import_batch, add_track, delete_track, track_up, track_down, zoom_in, zoom_out, zoom_fit, split_clip_button, delete_clip_button, snap_button,
-    record_button = 172, arm_button, monitor_button, files_exit = 180,
+    record_button = 172, arm_button, monitor_button, files_exit = 180, studio_folder_button,
     device_combo = 200, rate_edit, buffer_edit, outputs_edit, input_edit,
     connect_button, disconnect_button, panel_button, refresh_button
 };
@@ -90,6 +101,7 @@ struct UI {
     Preferences prefs;
     std::filesystem::path folder;
     Logger log;
+    StudioFolders studio;
     HWND window{}, settings{};
     HFONT normal{}, heading{}, big{};
     HBRUSH panel_brush{CreateSolidBrush(panel)};
@@ -109,7 +121,8 @@ struct UI {
     enum class DragMode { move, left, right };
     struct Drag { Clip original, preview; DragMode mode; Sample anchor{}, frames{}; POINT origin{}; bool changed{}; };
     std::optional<Drag> drag;
-    explicit UI(bool test) : folder(data_folder()), log(folder / L"studio.log"), smoke(test) {
+    explicit UI(bool test) : folder(data_folder()), log(folder / L"studio.log"), studio{studio_folder()}, smoke(test) {
+        studio.ensure();
         if (!smoke) {
             try {
                 std::ifstream file(folder / L"desktop.cfg",std::ios::binary);
@@ -157,7 +170,7 @@ struct UI {
         item(new_project_button,L"&New project\tCtrl+N"); item(open,L"&Open project...\tCtrl+O");
         separator(); item(save,L"&Save\tCtrl+S"); item(save_as,L"Save &as...\tCtrl+Shift+S");
         separator(); item(import_batch,L"&Import WAVs...\tCtrl+I"); item(import,L"Open &WAV as new project...");
-        item(demo,L"Open &demo project"); separator(); item(files_exit,L"E&xit");
+        item(demo,L"Open &demo project"); separator(); item(studio_folder_button,L"Open studio &folder"); item(files_exit,L"E&xit");
         if (!ok || !AppendMenuW(bar,MF_POPUP,reinterpret_cast<UINT_PTR>(files),L"&Files")) {
             DestroyMenu(files); DestroyMenu(bar); throw std::runtime_error("Cannot populate Files menu");
         }
@@ -241,8 +254,15 @@ struct UI {
         if (answer == IDYES) return save_current(false); return true;
     }
     bool save_current(bool as) {
-        auto path = as || app.path().empty() ? pick(window,true) : app.path(); if (path.empty()) return false;
-        app.save_project(path); log.write("Project saved"); refresh_models(); return true;
+        auto path = as || app.path().empty() ? pick(window,true,false,studio.projects(),
+            app.path().empty() ? wide(app.services().projects->state().project->title)+L".mrsproject" : app.path().filename().wstring()) : app.path();
+        if (path.empty()) return false;
+        const bool managed = !app.path().empty() &&
+            (app.path().parent_path().filename() == app.path().stem() ||
+             (std::filesystem::is_directory(app.path().parent_path()/"Media") && std::filesystem::is_directory(app.path().parent_path()/"Mixdown")));
+        if (as || !managed) path = project_folder_file(path);
+        if (path != app.path() && std::filesystem::exists(path)) throw std::runtime_error("This project folder already exists. Choose a new project name.");
+        app.save_project(path); log.write("Project and Media saved"); refresh_models(); return true;
     }
     void preferences() {
         prefs.workspace = app.workspace();
@@ -365,7 +385,7 @@ struct UI {
             if (app.recording()) (void)app.stop_recording();
             else {
                 if (app.path().empty() && !save_current(false)) break;
-                auto audio_folder = std::filesystem::absolute(app.path()).parent_path()/L"Audio";
+                auto audio_folder = std::filesystem::absolute(app.path()).parent_path()/L"Media";
                 std::filesystem::create_directories(audio_folder);
                 app.start_recording(audio_folder/("Take-"+new_id().value+".wav"));
             }
@@ -382,8 +402,17 @@ struct UI {
             if (selection >= 0 && static_cast<std::size_t>(selection) < project->tracks.size()) app.rename_track(project->tracks[static_cast<std::size_t>(selection)].id,narrow(control_text(child(rename_edit))));
             refresh_models(); break;
         }
-        case new_project_button: if (discard()) { app.new_project(prefs.rate); fit_view = true; view_start = 0; first_track = 0; refresh_models(); restore_audio(); } break;
+        case new_project_button: if (discard()) {
+            const auto selected = pick(window,true,false,studio.projects(),L"Untitled.mrsproject");
+            if (!selected.empty()) {
+                const auto path = project_folder_file(selected);
+                if (std::filesystem::exists(path)) throw std::runtime_error("This project already exists. Choose a new name.");
+                app.new_project(prefs.rate,narrow(path.stem().wstring())); app.save_project(path);
+                fit_view = true; view_start = 0; first_track = 0; refresh_models(); restore_audio();
+            }
+        } break;
         case import_batch: {
+            if (app.path().empty() && !save_current(false)) break;
             auto paths = pick_wavs(window);
             if (!paths.empty()) { app.import_wavs(paths); fit_view = true; refresh_models(); }
             break;
@@ -416,11 +445,15 @@ struct UI {
         case zoom_in: fit_view = false; visible_seconds = std::max(0.25,visible_seconds/2); break;
         case zoom_out: fit_view = false; visible_seconds = std::min(86400.0,visible_seconds*2); break;
         case zoom_fit: fit_view = true; view_start = 0; break;
-        case open: if (discard()) { auto path = pick(window,false); if (!path.empty()) { app.open_project(path); refresh_models(); restore_audio(); } } break;
-        case import: if (discard()) { auto path = pick(window,false,true); if (!path.empty()) { app.import_wav(path); refresh_models(); restore_audio(); } } break;
+        case open: if (discard()) { auto path = pick(window,false,false,studio.projects()); if (!path.empty()) { app.open_project(path); refresh_models(); restore_audio(); } } break;
+        case import: if (discard()) { auto path = pick(window,false,true); if (!path.empty()) { app.import_wav(path); refresh_models(); restore_audio(); (void)save_current(false); } } break;
         case demo: if (discard()) { app.demo(); refresh_models(); restore_audio(); } break;
         case save: (void)save_current(false); break; case save_as: (void)save_current(true); break;
         case audio_settings: show_settings(); break;
+        case studio_folder_button:
+            if (reinterpret_cast<INT_PTR>(ShellExecuteW(window,L"open",studio.root.c_str(),nullptr,nullptr,SW_SHOWNORMAL)) <= 32)
+                throw std::runtime_error("Cannot open studio folder");
+            break;
         case files_exit: PostMessageW(window,WM_CLOSE,0,0); break;
         }
         InvalidateRect(window,nullptr,FALSE);
@@ -784,6 +817,8 @@ LRESULT CALLBACK main_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam
                     const auto bar = GetMenu(hwnd), files = GetSubMenu(bar,0);
                     if (!bar || !files || GetMenuItemID(files,0) != new_project_button || GetMenuItemID(files,3) != save)
                         throw std::runtime_error("Files menu did not retain project commands");
+                    if (GetMenuItemID(files,10) != studio_folder_button || !std::filesystem::is_directory(ui->studio.projects()) || !std::filesystem::is_directory(ui->studio.lives()))
+                        throw std::runtime_error("Studio content folders/menu missing");
                     for (auto id : {record_button,arm_button,monitor_button}) if (!ui->child(id)) throw std::runtime_error("Recording controls missing");
                     ui->command(arm_button,0);
                     if (!ui->app.armed_track()) throw std::runtime_error("Arm track did not use shared application");

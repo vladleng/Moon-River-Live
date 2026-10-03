@@ -421,6 +421,95 @@ void recording() {
     }
 }
 
+
+std::size_t file_count(const std::filesystem::path& folder) {
+    std::size_t count{}; for (const auto& entry : std::filesystem::recursive_directory_iterator(folder)) if (entry.is_regular_file()) ++count;
+    return count;
+}
+void project_folders() {
+    Directory dir, originals; StudioFolders studio{dir.path/"MR Studio"}; studio.ensure();
+    CHECK(std::filesystem::is_directory(studio.projects()) && std::filesystem::is_directory(studio.lives()));
+    const auto name = std::filesystem::path(std::u8string(u8"Песня"));
+    const auto file = project_folder_file(studio.projects()/(name.native()+std::filesystem::path(".mrsproject").native()));
+    CHECK(file.parent_path() == studio.projects()/name && file.filename().stem() == name);
+    CHECK(project_folder_file(file) == file);
+    Application app; app.new_project(44100,"Song"); app.save_project(file);
+    CHECK(std::filesystem::exists(file) && std::filesystem::is_directory(file.parent_path()/"Media") && std::filesystem::is_directory(file.parent_path()/"Mixdown"));
+    std::filesystem::create_directory(originals.path/"A"); std::filesystem::create_directory(originals.path/"B");
+    const auto a = originals.path/"A"/"same.wav", b = originals.path/"B"/"same.wav"; wav(a,1); wav(b);
+    app.import_wavs({a,b,a});
+    const auto clips = app.services().projects->state().project->clips;
+    CHECK(clips.size() == 3 && clips[0].source == clips[2].source && clips[0].source != clips[1].source);
+    CHECK(file_count(file.parent_path()/"Media") == 2 && std::filesystem::exists(a) && std::filesystem::exists(b));
+    const auto count = file_count(file.parent_path()/"Media");
+    rejects([&] { app.import_wavs({a,originals.path/"missing.wav"}); });
+    CHECK(file_count(file.parent_path()/"Media") == count && app.services().projects->state().project->clips.size() == 3);
+    app.save_project(file);
+    const auto saved = persistence::load_project(file);
+    for (const auto& clip : saved.project.clips) {
+        const auto source = std::filesystem::path(std::u8string(clip.source.begin(),clip.source.end()));
+        CHECK(source.is_relative() && *source.begin() == "Media" && std::filesystem::exists(file.parent_path()/source));
+    }
+    CHECK(std::filesystem::remove(a) && std::filesystem::remove(b)); // imported media is independent
+    std::filesystem::copy_file(file.parent_path()/std::filesystem::path(std::u8string(clips[0].source.begin(),clips[0].source.end())),file.parent_path()/"Media"/"Unused.wav");
+    { std::ofstream export_file(file.parent_path()/"Mixdown"/"render.txt"); export_file << "future export content"; }
+    app.connect(std::make_unique<ManualDevice>(),{0,44100,128,{}, {0,1}});
+    std::array<float,256> output{};
+    app.seek(600); app.engine()->process(nullptr,output.data(),128);
+    app.play(); app.engine()->process(nullptr,output.data(),128);
+    app.save_project(file); CHECK(app.engine()->state().playback == PlaybackState::playing); // ordinary save remains possible while playing
+    app.pause(); app.engine()->process(nullptr,output.data(),128);
+    const auto position = app.engine()->state().sample;
+    const auto copy = project_folder_file(studio.projects()/"Copy.mrsproject");
+    app.save_project(copy);
+    CHECK(app.path() == copy && app.audio_running() && app.engine()->state().sample == position && app.engine()->state().playback == PlaybackState::paused);
+    CHECK(file_count(copy.parent_path()/"Media") == 3 && std::filesystem::exists(copy.parent_path()/"Mixdown"/"render.txt"));
+    CHECK(app.undo() && app.services().projects->state().project->clips.empty());
+    CHECK(app.redo() && app.services().projects->state().project->clips.size() == 3);
+    app.save_project(copy); const auto snapshot = app.snapshot();
+    app.new_project(44100); // close device/workers before moving folders
+    const auto moved = dir.path/"Portable";
+    std::filesystem::rename(copy.parent_path(),moved);
+    app.open_project(moved/copy.filename()); CHECK(app.snapshot().project == snapshot.project);
+    app.connect(std::make_unique<ManualDevice>(),{0,44100,128,{}, {0,1}}); app.play();
+    app.engine()->process(nullptr,output.data(),128);
+    CHECK(output[0] == 0.18310546875f && output[1] == output[0]);
+    app.pause(); app.engine()->process(nullptr,output.data(),128);
+    const auto foreign = project_folder_file(studio.projects()/"Foreign.mrsproject");
+    Application other; other.save_project(foreign);
+    const auto identity = persistence::load_project(foreign).project.id;
+    rejects([&] { app.save_project(foreign); });
+    CHECK(app.path() == moved/copy.filename() && persistence::load_project(foreign).project.id == identity);
+
+    // Upgrade an external long source, then Save As again without the original.
+    const auto long_file = originals.path/"Long.wav";
+    constexpr std::uint32_t frames = 3'000'000;
+    {
+        std::ofstream out(long_file,std::ios::binary);
+        const auto u16 = [&](std::uint16_t n) { for (int i=0; i<2; ++i) out.put(static_cast<char>((n>>(8*i))&255)); };
+        const auto u32 = [&](std::uint32_t n) { for (int i=0; i<4; ++i) out.put(static_cast<char>((n>>(8*i))&255)); };
+        out.write("RIFF",4); u32(36+frames*4); out.write("WAVEfmt ",8); u32(16);
+        u16(3); u16(1); u32(44100); u32(176400); u16(4); u16(32);
+        out.write("data",4); u32(frames*4); u32(0x3e800000); // first frame 0.25f
+        out.seekp(static_cast<std::streamoff>(44)+frames*4-1); out.put(0);
+    }
+    Application legacy; legacy.import_wav(long_file);
+    const auto legacy_source = legacy.services().projects->state().project->clips.front().source;
+    const auto long_project = project_folder_file(studio.projects()/"Long.mrsproject");
+    legacy.save_project(long_project);
+    CHECK(persistence::load_project(long_project).project.clips.front().source.starts_with("Media/"));
+    CHECK(std::filesystem::remove(long_file));
+    legacy.connect(std::make_unique<ManualDevice>(),{0,44100,128,{}, {0,1}});
+    legacy.play(); legacy.engine()->process(nullptr,output.data(),128); CHECK(output[0] == 0.125f);
+    legacy.pause(); legacy.engine()->process(nullptr,output.data(),128);
+    const auto long_copy = project_folder_file(studio.projects()/"Long-copy.mrsproject");
+    legacy.save_project(long_copy);
+    CHECK(legacy.services().projects->state().project->clips.front().source == legacy_source); // stable source aliases/Undo
+    legacy.seek(0); legacy.play(); legacy.engine()->process(nullptr,output.data(),128); CHECK(output[0] == 0.125f);
+    legacy.pause(); legacy.engine()->process(nullptr,output.data(),128);
+    legacy.open_project(long_copy); CHECK(legacy.snapshot().project == persistence::load_project(long_copy).project);
+}
+
 void config() {
     Preferences p; p.workspace = Workspace::live; p.device_name = "Komplete Audio ASIO Driver"; p.reconnect_audio = true;
     CHECK(decode_preferences(encode_preferences(p)) == p);
@@ -444,7 +533,7 @@ int main(int argc, char** argv) {
         std::string name = argv[1];
         if (name == "workspaces") workspaces(); else if (name == "transport") transport();
         else if (name == "files") files(); else if (name == "assets") assets();
-        else if (name == "mono_route") mono_route(); else if (name == "audio") audio_settings(); else if (name == "config") config(); else if (name == "arrangement") arrangement(); else if (name == "waveform") waveform(); else if (name == "nonplaying_edits") nonplaying_edits(); else if (name == "streaming") streaming(); else if (name == "clip_edits") clip_edits(); else if (name == "recording") recording(); else throw std::runtime_error("unknown suite");
+        else if (name == "mono_route") mono_route(); else if (name == "audio") audio_settings(); else if (name == "config") config(); else if (name == "arrangement") arrangement(); else if (name == "waveform") waveform(); else if (name == "nonplaying_edits") nonplaying_edits(); else if (name == "streaming") streaming(); else if (name == "clip_edits") clip_edits(); else if (name == "recording") recording(); else if (name == "project_folders") project_folders(); else throw std::runtime_error("unknown suite");
         std::cout << "PASS desktop " << name << '\n'; return 0;
     } catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
 }

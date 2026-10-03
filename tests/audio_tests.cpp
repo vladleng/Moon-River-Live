@@ -265,6 +265,7 @@ void streaming() {
     engine->prepare({48000,0,1,128},graph);
     transport.play();
     std::atomic<bool> running{true}, correct{true};
+    Sample mismatch_frame{}; float mismatch_actual{}, mismatch_expected{};
     std::thread callback([&] {
         std::array<float,128> block{};
         while (running.load()) {
@@ -273,7 +274,9 @@ void streaming() {
             allocation_check::enabled = false;
             const auto first = engine->state().sample-128;
             for (Sample f = 0; f < 128; ++f)
-                if (block[static_cast<std::size_t>(f)] != (first+f < total ? static_cast<float>((first+f)%127)/256.0F : 0.0F)) correct = false;
+                if (const auto expected = first+f < total ? static_cast<float>((first+f)%127)/256.0F : 0.0F; block[static_cast<std::size_t>(f)] != expected && correct.exchange(false)) {
+                    mismatch_frame = first+f; mismatch_actual = block[static_cast<std::size_t>(f)]; mismatch_expected = expected;
+                }
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
     });
@@ -284,7 +287,17 @@ void streaming() {
         }
     } catch (...) { running = false; callback.join(); throw; }
     running = false; callback.join();
+    if (!correct.load()) std::cerr << "stream mismatch: frame=" << mismatch_frame << " actual=" << mismatch_actual << " expected=" << mismatch_expected << " underruns=" << engine->metrics().disk_underruns << '\n';
     CHECK(correct.load()); CHECK(engine->metrics().disk_underruns == 0); CHECK(allocation_check::count.load() == 0);
+    // With the callback quiescent, queued UI seeks coalesce to the last ready
+    // target. Do not allow a retry implementation to silently ignore seeks.
+    for (const auto target : {120000,50000,130000,1000,140000,70000}) transport.seek(target);
+    engine->process(nullptr,output.data(),128);
+    CHECK(engine->state().sample == 70128);
+    for (Sample f=0; f<128; ++f) CHECK(output[static_cast<std::size_t>(f)] == static_cast<float>((70000+f)%127)/256.0F);
+    CHECK(engine->metrics().disk_underruns == 0);
+    transport.seek(1000); transport.stop(); engine->process(nullptr,output.data(),128);
+    CHECK(engine->state().sample == 0 && engine->state().playback == PlaybackState::stopped);
     std::filesystem::remove(file.path);
     rejects([&] { transport.seek(40000); });
     CHECK(engine->enqueue({ControlKind::seek,40000})); CHECK(engine->enqueue({ControlKind::play}));

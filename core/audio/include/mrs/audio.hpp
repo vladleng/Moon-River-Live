@@ -88,7 +88,7 @@ public:
         return true;
     }
 };
-enum class ControlKind { play, pause, stop, seek, loop, monitor };
+enum class ControlKind { play, pause, stop, seek, loop, monitor, prepared_seek };
 struct Control { ControlKind kind{}; Sample a{}, b{}; };
 struct RealtimeState {
     PlaybackState playback{PlaybackState::stopped};
@@ -120,6 +120,7 @@ private:
     std::atomic<float> input_peak_{};
     SpscQueue<Control, 64> controls_;
     RealtimeState rt_;
+    std::optional<Sample> pending_seek_; // RT-owned, coalesces prepared UI seeks
     std::atomic<std::uint64_t> sequence_{};
     std::atomic<Sample> published_sample_{}, published_loop_start_{}, published_loop_end_{};
     std::atomic<int> published_playback_{};

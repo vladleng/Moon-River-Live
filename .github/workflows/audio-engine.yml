@@ -21,6 +21,8 @@ jobs:
         run: cmake --build build --config ${{ matrix.config }} --parallel 2
       - name: Contract and offline render tests (no physical audio device in CI)
         run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
+      - name: Repeat concurrent seek regression
+        run: ctest --test-dir build -C ${{ matrix.config }} -R "^audio_streaming$" --repeat until-fail:8 --output-on-failure
       - name: Offline acceptance
         run: ./build/${{ matrix.config }}/mrs_audio_check.exe --self-test
       - name: Prepare developer check package
@@ -52,6 +54,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path studio-package -Force | Out-Null
           Copy-Item -LiteralPath build/Release/MoonRiverStudio.exe -Destination studio-package/
+          Copy-Item -LiteralPath docs/MRS_PROJECT_FOLDERS_CHECKLIST.md -Destination studio-package/
+          Copy-Item -LiteralPath docs/PROJECT_FOLDERS.md -Destination studio-package/
           Copy-Item -LiteralPath docs/MRS_STAGE_1D_CHECKLIST.md -Destination studio-package/
           Copy-Item -LiteralPath docs/RECORDING.md -Destination studio-package/
           Copy-Item -LiteralPath docs/MRS_STAGE_1C_UPD1_CHECKLIST.md -Destination studio-package/
@@ -68,6 +72,6 @@ jobs:
         if: matrix.config == 'Release'
         uses: actions/upload-artifact@v4
         with:
-          name: MR-Studio-0.1e-ASIO-Windows
+          name: MR-Studio-0.1e-upd1-fix1-ASIO-Windows
           path: studio-package/
           if-no-files-found: error

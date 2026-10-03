@@ -323,3 +323,30 @@ MRS Stage 1d / 0.1e принят; PR #46 слит в main. Подтвержде�
 PR CI: все шесть jobs пройдены (56/56 Linux/ASIO, 57/57 Windows offline).
 Следующая работа после паузы: MRS Stage 2 / #22 Mixer / Routing; реализация не начата.
 Пользователь попросил продолжить 2026-10-04 по Asia/Krasnoyarsk. 
+
+
+## 0.1e upd1 fix1 — folders and portable projects
+Windows content root: Documents/MR Studio with Projects and Lives.
+Each project owns <name>/<name>.mrsproject, Media and Mixdown. Imported WAVs
+copy into Media; recordings write there. Archives use relative Media/... references.
+Save As copies Media/Mixdown and retains Undo/device continuity; original project
+and source files remain intact. Move the whole folder, then reopen its .mrsproject.
+[Contracts](docs/PROJECT_FOLDERS.md) · [Windows checklist](docs/MRS_PROJECT_FOLDERS_CHECKLIST.md).
+PR #47, acceptance pending. Lives prepares storage for future .mrlive workflow;
+Mixdown prepares storage for later export. Mixer/Routing #22 follows after upd1.
+
+
+## Included fix1: concurrent seek read-head protection
+Seek priming previously published the future target as the current read head before
+its queued transport command reached the callback. A worker could then evict the
+still-playing page in that interval. Prime sets the initial head only once,
+keeps the future target separately warm, and lets the callback move the active head.
+The worker skips protected pages before claiming ownership. A control/worker-only
+atomic gate serializes the ready snapshot with victim selection, closing the stale
+snapshot window without waiting, locking or I/O on the audio callback.
+Prepared UI seeks are coalesced and applied only after the callback pins all needed
+target pages. If a later prime displaced an earlier target, the callback continues
+the current position and retries on its next block; worker retry pages remain
+protected. This closes the queued-command handoff race without blocking RT.
+The concurrent seek exact-sample/zero-underrun/zero-RT-allocation regression is
+repeated eight times in every Debug/Release CI job for this fix.

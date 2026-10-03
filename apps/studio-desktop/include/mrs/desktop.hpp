@@ -7,6 +7,7 @@
 #include <mrs/waveform.hpp>
 #include <future>
 #include <mrs/recording.hpp>
+#include <mrs/project_folders.hpp>
 namespace mrs::desktop {
 enum class Workspace { arrange, edit, mix, live };
 std::string_view workspace_name(Workspace);
@@ -47,7 +48,7 @@ public:
     void workspace(Workspace);
     void poll();
     void demo();
-    void new_project(std::uint32_t rate = 48000);
+    void new_project(std::uint32_t rate = 48000, std::string title = "Untitled");
     Id add_audio_track(std::string name);
     void remove_track(const Id&);
     void reorder_track(const Id&, std::size_t index);
@@ -116,6 +117,8 @@ private:
         std::optional<audio::Waveform> peaks;
     };
     std::map<std::string,CachedAsset> assets_;
+    // Runtime source aliases preserve ProjectStore Undo while archives use Media/... paths.
+    std::map<std::string,std::filesystem::path> owned_media_;
     std::optional<audio::DeviceConfig> device_config_;
     std::shared_ptr<const audio::AudioData> asset(const std::string&);
     void cache_asset(std::string, std::shared_ptr<const audio::AudioData>);

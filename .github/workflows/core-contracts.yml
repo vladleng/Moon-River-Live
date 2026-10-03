@@ -22,6 +22,8 @@ jobs:
         run: cmake --build build --config ${{ matrix.config }} --parallel 2
       - name: Test
         run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
+      - name: Repeat concurrent seek regression
+        run: ctest --test-dir build -C ${{ matrix.config }} -R "^audio_streaming$" --repeat until-fail:8 --output-on-failure
       - name: Acceptance check (Windows)
         if: runner.os == 'Windows'
         run: ./build/${{ matrix.config }}/mrs_core_check.exe
@@ -91,10 +93,12 @@ jobs:
         if: runner.os == 'Windows' && matrix.config == 'Release'
         uses: actions/upload-artifact@v4
         with:
-          name: MR-Studio-0.1e-Offline-Windows
+          name: MR-Studio-0.1e-upd1-fix1-Offline-Windows
           path: |
             build/Release/MoonRiverStudio.exe
             docs/MRS_STAGE_0_CHECKLIST.md
+            docs/MRS_PROJECT_FOLDERS_CHECKLIST.md
+            docs/PROJECT_FOLDERS.md
             docs/MRS_STAGE_1D_CHECKLIST.md
             docs/RECORDING.md
             docs/MRS_STAGE_1C_UPD1_CHECKLIST.md

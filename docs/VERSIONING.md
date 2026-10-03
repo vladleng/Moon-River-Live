@@ -33,3 +33,27 @@ Live Mode входит в ту же сборку и не получает отд
 
 При объединении upd и fix в одной сборке оба счётчика указываются: `0.1d upd1 fix1`.
 Имя артефакта: `MR-Studio-0.1d-upd1-fix1-ASIO-Windows`.
+
+
+## 0.1e upd1 fix1 — requested folder follow-up
+User requested project-owned content folders on 2026-10-03 after accepting 0.1e.
+Small update keeps base 0.1e: UI version 0.1e upd1 fix1;
+artifact MR-Studio-0.1e-upd1-fix1-ASIO-Windows. PR #47, user acceptance pending.
+See PROJECT_FOLDERS.md and MRS_PROJECT_FOLDERS_CHECKLIST.md. Next Mixer/Routing
+substage/version is still to be planned after this update.
+
+
+## Included fix1: concurrent seek read-head protection
+Seek priming previously published the future target as the current read head before
+its queued transport command reached the callback. A worker could then evict the
+still-playing page in that interval. Prime sets the initial head only once,
+keeps the future target separately warm, and lets the callback move the active head.
+The worker skips protected pages before claiming ownership. A control/worker-only
+atomic gate serializes the ready snapshot with victim selection, closing the stale
+snapshot window without waiting, locking or I/O on the audio callback.
+Prepared UI seeks are coalesced and applied only after the callback pins all needed
+target pages. If a later prime displaced an earlier target, the callback continues
+the current position and retries on its next block; worker retry pages remain
+protected. This closes the queued-command handoff race without blocking RT.
+The concurrent seek exact-sample/zero-underrun/zero-RT-allocation regression is
+repeated eight times in every Debug/Release CI job for this fix.
